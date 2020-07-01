@@ -1,0 +1,651 @@
+---
+title: "Statistical Learning Challenge with Kaggle Titanic Dataset"
+author: "hhp2125"
+date: "7/1/2020"
+output:
+  html_document:
+    css: style.css
+    toc: true
+    number_sections: FALSE
+    toc_float:
+        collapsed: false
+        smooth_scroll: false
+    theme: cerulean
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r, echo = TRUE}
+library("data.table")
+library("janitor")
+library("GGally")
+library("missForest")
+library("randomForest")
+library("MASS")
+library("class")
+library("caret")
+library("ModelMetrics")
+library("tidyverse")
+library("magrittr")
+library("glmnet")
+```
+
+# Acknowledgement
+
+Formatting and data processing ideas are heavily inspired by [Bisaria's post on Kaggle](https://www.kaggle.com/bisaria/titanic-lasso-ridge-implementation/code).    
+
+# Skills Involved    
+
+R-base, tidyverse, Statistical Learning, Data Wrangling, String manipulation, function programming, data imputation.   
+
+# What is Kaggle
+
+[Kaggle](https://www.kaggle.com/) is a website that post challenges in the field of machine learning. For the titanic challenge, partakers are given two datasets - train and test. The train dataset would contain the outcome and the test dataset would not. After generating the predicted outcome for the test dataset based on the model trained in the train dataset, partakers would submit the results to Kaggle website for scoring. The score for this challenge is the proportion of correct guesses. 
+
+# Synopsis    
+
+This is an application of some of the statistical learning methods in ISLR. In particular, we are using Logistic Regression, Ridge Regression, Lasso Regression, and Radial SVM to predict the survival status (0 = perished, 1 = survived) of [Kaggle's Titanic Dataset](https://www.kaggle.com/c/titanic/overview). The main challenge of this dataset lies in imputing the variable "age" and "deck." Using `missForest::missForest`, we imputed the age variable. From other clues such as the same ticket numbers would be the same deck, and certain ticket class would correspond to certain decks, we imputed all the decks values.    
+
+Through the process and submission on Kaggle, Radial SVM was the most accurate with the proportion of correct prediction = 0.79904 (Top 12% as of 6/30/2020).    
+
+# Load the Data    
+
+```{r, cache=TRUE, results = "hide"}
+train<-read_csv("./data/train.csv", col_types = "nffcfnnncncf")%>%    #training dataset
+        clean_names %>%
+        mutate(type = as.factor(rep ("Train", times = length(.$age))))
+test<-read_csv("./data/test.csv", col_types = "nfcfnnncncf") %>%     #test dataset
+        clean_names %>%
+        mutate(type = as.factor(rep ("Test", times = length(.$age))))
+full<- train %>% 
+        dplyr::select(-survived) %>%
+        full_join(.,test)
+```
+
+The "train" and "test" dataset were loaded. The "full" dataset was used to impute NAs values.      
+
+# Exploratory Analysis 
+## Figures and Plots   
+
+```{r}
+knitr::kable(head(train), align="l", caption="Training Dataset")
+```  
+
+The Data Dictionary is as below:      
+        
+```{r}
+dictionary<-fread("./data/dictionary.txt", sep=",")
+knitr::kable(dictionary, align="l")
+```
+
+The data also comes with the following notes:    
+
+<div class="quote-container">    
+        
+> Variable Notes  
+> pclass: A proxy for socio-economic status (SES)   
+> - 1st = Upper   
+> - 2nd = Middle  
+> - 3rd = Lower  
+>   
+> age: Age is fractional if less than 1. If the age is estimated, is it in the form of xx.5  
+>   
+> sibsp: The dataset defines family relations in this way...  
+> - Sibling = brother, sister, stepbrother, stepsister  
+> - Spouse = husband, wife (mistresses and fiancés were ignored)  
+>   
+> parch: The dataset defines family relations in this way...  
+> - Parent = mother, father  
+> - Child = daughter, son, stepdaughter, stepson  
+> - Some children travelled only with a nanny, therefore parch=0 for them.  
+
+</div>      
+
+We plot the pairwise scatter plot to have a cursory look at the whole dataset.
+        
+```{r, cache= TRUE, out.width = "110%"}
+pair_plot<-train %>% 
+        dplyr::select(-c(passenger_id,name,ticket,cabin,type)) %>%
+        ggpairs(.,
+                columns = names(.),
+                upper = list(continuous = wrap("cor", size = 3))) +       #change the font of the Correlation
+        ggtitle("Data Correlation Plot")
+pair_plot
+```    
+
+We can see that there are significant correlation between the predictor variables. Ridge and Lasso regression should be robust against multi-collinearity.     
+
+## Comments       
+
+The biggest issue with our dataset is the NAs. From the following table, we can see that "age" and "cabin" have the most numbers of NAs.        
+
+```{r}
+na_count<- full %>%   #calculate number of NA in each variable
+        group_by(type) %>%
+        summarize(
+                across(.cols = everything(),
+                       function(x){
+                               sum(is.na(x))
+                       }
+                )
+        )
+knitr::kable(na_count, align="l", caption="Number of NAs in each dataset by variables") 
+```    
+
+Strategies for "age" and "cabin" imputations is discussed individually below. The imputation will be performed on a merged dataset of both "test" and "train".     
+
+# Feature Engineering     
+## "pclass" or ticket class       
+R incorrectly assumed pclass == 3 is the highest level, so we have to recode the variable appropriately as in pclass == 1 > pclass == 2 > pclass == 3. This change is more meaningful for inference than for prediction.    
+
+Before    
+```{r}
+str(full$pclass) #before
+
+full <- full %>%
+        mutate(pclass = fct_relevel(.$pclass, "3", "2","1"))
+```   
+
+After      
+```{r}
+str(full$pclass) #after
+```
+
+pclass == 1 is now correctly the highest level.     
+
+## "name"       
+The "name" variable is stored in the form: "Last Name, Title. Middle First Name." (e.g, Braund, Mr. Owen Harris). We are mostly concerned with the last name and title of the person. Last names can determine if people are in the same family and are traveling together (hence staying in the same cabin). Title can indicate the age of the person if the person's age is missing. For example, "Dr." would indicate someone older and "Master" would be some one younger. We also convert all characters to lower case.    
+
+```{r}
+full_2<- full %>% 
+        mutate(name = str_to_lower(.$name)) %>%
+        separate(
+                col = name, 
+                into = c("last_name","first_name"),
+                sep = ",",
+                remove = TRUE,
+                convert = FALSE,
+                extra = "warn",
+                fill = "warn",) %>%   
+        separate(
+                col = first_name, 
+                into = c("title","first_name"),
+                sep = "\\.",
+                remove = TRUE,
+                convert = FALSE,
+                extra = "drop",
+                fill = "warn",) %>%
+        mutate(title = str_trim(title)) %>%	
+        mutate(title = as.factor(title)) %>%
+        mutate(na = is.na(age))
+
+knitr::kable(full %>% dplyr::select(name) %>% head, align ="l", caption = "Before")
+knitr::kable(full_2 %>% dplyr::select(title, first_name, last_name) %>% head, align = "l", caption = "After")
+```     
+
+## Title of a passenger   
+
+We examine the number of different titles in the dataset.     
+
+```{r}
+sum_title<-full_2 %>% 
+        dplyr::select(title, age) %>%
+        group_by(title) %>%
+        summarize(range = range(age, na.rm = TRUE), count = n(), missing_age = sum(is.na(age))) %>%
+        mutate(min_max = rep(c("min age","max age"))) %>%
+        pivot_wider(names_from = min_max, values_from = range) %>% 
+        arrange(desc(count))
+
+knitr::kable(sum_title)     
+```
+
+We merge the titles to minimize the number of categories as follows.  
+
+```{r}     
+title_merge<- data.frame(
+        new_title = c("sir","madam","young_master","young_miss"), 
+        old_title = c("mr, capt, col, don,  major,  rev,  jonkheer, sir, dr and sex = male, master and age > 14.5",
+                      "mrs, dona, mlle, mme, dr and sex = female, ms, miss and age > 14.5,the countess, lady",
+                      "master and age <= 14.5, mr and age <=14.5",
+                      "miss and age <= 14.5"),
+        description = c("Male, age > 14.5",
+                      "Female, age > 14.5",
+                      "Male, age <= 14.5",
+                      "Female, age <= 14.5"
+        )
+)
+
+knitr::kable(title_merge, align="l", caption="Merging titles") 
+```    
+          
+First we convert every "master" at age > 14.5 to "sir", "miss" at age >14.5 to "madam", "mr" at age < 14.5 to "young_master", and "mrs" at age < 14.5 to "young_miss" and male/female "dr" to sir/madam. Then we merge the title as above using `forcats::fct_collapse`.        
+
+```{r}
+full_3<- full_2 %>%
+        mutate(title = case_when(title == "master" & age > 14.5 ~ "sir",
+                                 title == "miss" & age > 14.5 ~ "madam",
+                                 title == "mr" & age <= 14.5 ~ "young_master",
+                                 title == "mrs" & age <= 14.5 ~ "young_miss",
+                                 title == "dr" & sex == "male" ~ "sir",
+                                 title == "dr" & sex == "female" ~ "madam",
+                                 TRUE ~ as.character(.$title))) %>%
+        mutate(title = fct_collapse(.$title, 
+                                    "sir" = c("mr", "capt", "col", "don", "major", "rev","sir",  "jonkheer"),
+                                    "madam"= c("dona", "mlle", "mme", "ms", "the countess", "lady","mrs"),
+                                    "young_master" = c("master", "young_master"),
+                                    "young_miss" = c("young_miss","miss")
+        )
+)
+
+sum_title_3<-full_3 %>% 
+        dplyr::select(title, age) %>%
+        group_by(title) %>%
+        summarize(range = range(age, na.rm = TRUE), count = n(), missing_age = sum(is.na(age))) %>%
+        mutate(min_max = rep(c("min age","max age"))) %>%
+        pivot_wider(names_from = min_max, values_from = range) %>% 
+        arrange(desc(count))
+
+knitr::kable(sum_title_3,  align="l", caption="Dataset with merged title")
+```   
+
+From this table, we can see that we have successfully merged the title as described. We can now move on to imputation of the "age", "embark", and "fare". Imputation of the "cabin" variable will be dealt with separately.           
+
+## Imputation of "age", "embark", "fare" with `missForest::missForest`       
+
+Before imputing with `missForest::missForest`:
+
+```{r}
+knitr::kable(na_count, align="l", caption="Number of NAs in each dataset by variables") 
+```      
+
+```{r}
+set.seed(400)     #impute the data with missForest::missForest
+data_imp<- full_3 %>%
+        dplyr::select(pclass,sex,age,sib_sp,parch,fare,embarked, title) 
+        
+imputed<-missForest(data.frame(data_imp))
+
+data_imp_1<-imputed$ximp %>% 
+        as_tibble %>%
+        mutate(passenger_id = full_3$passenger_id) %>%
+        dplyr::select(age, fare, embarked, passenger_id)
+
+full_4<- full_3 %>% 
+        dplyr::select(passenger_id, setdiff(names(full_3),names(data_imp_1))) %>%
+        full_join(.,data_imp_1, by = "passenger_id")
+```    
+
+After `missForest::missForest` imputation:
+
+```{r}
+na_count_1<- full_4 %>%   #calculate number of NA in each variable
+        group_by(type) %>%
+        summarize(
+                across(.cols = everything(),
+                       function(x){
+                               sum(is.na(x))
+                       }
+                )
+        )
+knitr::kable(na_count_1, align="l", caption="Number of NAs in each dataset by variables") 
+```     
+
+`missForest::missForest` has imputed all the NAs in "age", "embark" and "fare". Now the only remaining variable with NAs is "cabin".
+
+## "ticket"      
+
+Ticket numbers have some information that helps us with imputing the "cabin" variable.      
+
+```{r}
+knitr::kable(full_4 %>% dplyr::select(ticket) %>% head, align = "l", caption = "Some ticket numbers")
+```
+
+We see that ticket numbers are stored as a series of numbers at the end of the string. Using regex, we can easily extract the numbers from the tickets. For tickets that have no numbers, we assign it number the number 99999.      
+
+```{r}
+full_4<- full_4 %>%
+        mutate(tix_num = str_extract(full_4$ticket, "[0-9]+$")) %>%
+        mutate(tix_num = case_when(is.na(.$tix_num) ~ as.character(99999),
+                                   TRUE ~ as.character(.$tix_num))) %>%
+        mutate(tix_num = parse_number(.$tix_num)) 
+knitr::kable(full_4 %>% dplyr::select(tix_num) %>% head, align = "l", caption = "Extracted ticket numbers")
+```
+
+## "family members"     
+
+Merge "sib_sp" and "parch" into "family_mem" which is short for family member.     
+
+```{r}
+full_4<-full_4 %>%
+        mutate(family_mem = sib_sp+parch)
+```       
+        
+## "cabin" and "deck"         
+
+Cabin is the variable with the most NAs. Let's first extract the first letter of the available cabin numbers into the variable "deck". We are also changing the deck "T" into deck "A". Deck "T" is just another first-class deck and there is only one value of deck "T" in the whole dataset.     
+
+```{r}
+full_5 <- full_4 %>%
+        mutate(deck = str_trim(.$cabin)) %>%
+        mutate(deck = str_to_lower(.$cabin)) %>%
+        mutate(deck = str_sub(.$cabin, start = 1, end =1))
+
+full_5[full_5$passenger_id == 340,"deck"] <- "A"
+knitr::kable(full_5%>% dplyr::select(cabin,deck) %>% filter(!is.na(.$deck)) %>% head, align = "l", caption = "Creating the 'deck' variable from 'cabin'")
+```
+
+We know that people who have the same ticket number must be on the same deck. Therefore, if there is a group of people with the same ticket number and one of them has a deck number then we assign that deck number to the whole group.       
+
+```{r}
+full_6 <- full_5 %>% #create dataset to deal specifically with imputing cabin
+        dplyr::select(passenger_id, pclass, tix_num,deck) %>%
+        arrange(tix_num) 
+
+same_tix<-function(data){
+        uniq<-unique(data$tix_num)
+        dat_1<-map(uniq,
+                   function(x){data %>%
+                                   dplyr::select(tix_num,deck) %>%
+                                   filter(tix_num == x) %>%
+                                   mutate(deck = case_when(all(is.na(.$deck)) ~ "NA",
+                                                           TRUE ~ as.character(.[(detect_index(.$deck %in% LETTERS, ~.)),"deck"])))
+                   })
+        filled_df<- dat_1 %>% 
+                reduce(full_join,  by = c("tix_num", "deck")) %>%
+                dplyr::select(deck)
+        final_df<- data %>%
+                dplyr::select(-deck) %>%
+                bind_cols(filled_df)
+}
+full_7<-same_tix(full_6)     
+```    
+
+In the example below, we see that two people have ticket number 3, one of them is on deck "E", so we assigned deck "E" to the other person who has missing deck value. Whereas two people have ticket number 2, but since none of them have a deck, we will impute their information later.          
+
+```{r}
+knitr::kable(full_6 %>% head, align = "l", caption = "Before")
+knitr::kable(full_7 %>% head, align = "l", caption = "After")
+```
+
+The following table shows the number of missing decks values in each "pclass".       
+
+```{r}
+full_7 %$% knitr::kable(table(deck, pclass),align="l", caption="Number of decks and NAs by pclass")
+```
+
+From this table, we see that there are `r 691+53+253` NAs after ticket number imputation. For the rest of the missing cabins, we shall randomly assign the deck number based on the unique ticket number by "pclass".       
+
+```{r}
+prop_cabin<-function(data){
+        uniq<-unique(data$tix_num)
+        dat_1<-map(uniq,
+                   function(x){data %>%
+                                   dplyr::select(passenger_id, pclass,tix_num,deck) %>%
+                                   filter(tix_num == x) %>%
+                                   dplyr::slice_head(n=1)})
+        filled_df<- dat_1 %>% 
+                reduce(full_join,
+                       by = c("passenger_id", "pclass","tix_num", "deck")) %>%
+                arrange(desc(pclass))
+}
+
+full_8<-prop_cabin(full_7)
+full_8 %$% knitr::kable(table(deck,pclass),align="l", caption="Number of unique decks and NAs by pclass")
+```   
+
+The following method is used for the random sampling to keep the ratio. For example: in class 3, there are 2 unique ticket numbers in deck E, 8 unique tickets number in deck F, and 2 unique tickets in deck G. There are 534 NAs in class 3. Hence, we would assign a ratio of 2:8:2 respectively to deck E:F:G in all of the 534 NAs. We follow the steps below:       
+        
+1. Determine the ratio of "decks" in each "pclass" to be randomly sampled.        
+2. Impute the deck based on the calculated ratio.        
+      
+```{r}
+imp_ratio<-function(pclass,deck){
+        NA_1<-19+31+49+24+20
+        NA_2<-6+4+8
+        NA_3<-2+8+2
+        num<-
+                if(pclass == 1){
+                        if(deck == "A"){
+                                return(round(19*43/NA_1))
+                        }
+                        if(deck == "B"){
+                                return(round(31*43/NA_1))
+                        }
+                        if(deck == "C"){
+                                return(round(49*43/NA_1))
+                        }
+                        if(deck == "D"){
+                                return(round(24*43/NA_1))
+                        }
+                        if(deck == "E"){
+                                return(43-round(19*43/NA_1)-round(31*43/NA_1)-round(49*43/NA_1)-round(24*43/NA_1))
+                        }
+                }
+        if(pclass == 2){
+                if(deck == "D"){
+                        return(round(6*174/NA_2))
+                }
+                if(deck == "E"){
+                        return(round(4*174/NA_2))
+                }
+                if(deck == "F"){
+                        return(174-round(6*174/NA_2)-round(4*174/NA_2))
+                }
+        }
+        if(pclass ==3){
+                if(deck == "E"){
+                        return(round(2*534/NA_3))
+                }
+                if(deck == "F"){
+                        return(round(8*534/NA_3))
+                }
+                if(deck == "G"){
+                        return(534-round(2*534/NA_3)-round(8*534/NA_3))
+                }
+        }
+        return(num)
+}
+
+sampling_ratio<-
+        lapply(1:3,
+               function(pclass){
+                       a<-LETTERS[seq(from = 1, to = 5)]
+                       b<-LETTERS[seq(from = 4, to = 6)]
+                       c<-LETTERS[seq(from = 5, to = 7)]
+                       results<-
+                               if(pclass == 1){mapply(imp_ratio, rep(1,length(a)), a)}
+                       else if(pclass == 2){mapply(imp_ratio, rep(2,length(b)), b)}
+                       else(mapply(imp_ratio, rep(3,length(c)), c))
+                       return(results)
+               })
+
+sampling_ratio
+```   
+
+R-base provides an elegant way to impute the decks based on the above ratio.             
+
+```{r}
+
+full_9<-full_8%>%filter(deck=="NA")
+
+set.seed(100)
+full_9[sample(which(full_9$pclass==1&full_9$deck=="NA"),sampling_ratio[[1]][1]),"deck"]<-rep("A",sampling_ratio[[1]][1])
+full_9[sample(which(full_9$pclass==1&full_9$deck=="NA"),sampling_ratio[[1]][2]),"deck"]<-rep("B",sampling_ratio[[1]][2])
+full_9[sample(which(full_9$pclass==1&full_9$deck=="NA"),sampling_ratio[[1]][3]),"deck"]<-rep("C",sampling_ratio[[1]][3])
+full_9[sample(which(full_9$pclass==1&full_9$deck=="NA"),sampling_ratio[[1]][4]),"deck"]<-rep("D",sampling_ratio[[1]][4])
+full_9[sample(which(full_9$pclass==1&full_9$deck=="NA"),sampling_ratio[[1]][5]),"deck"]<-rep("E",sampling_ratio[[1]][5])
+
+set.seed(100)
+full_9[sample(which(full_9$pclass==2&full_9$deck=="NA"),sampling_ratio[[2]][1]),"deck"]<-rep("D",sampling_ratio[[2]][1])
+full_9[sample(which(full_9$pclass==2&full_9$deck=="NA"),sampling_ratio[[2]][2]),"deck"]<-rep("E",sampling_ratio[[2]][2])
+full_9[sample(which(full_9$pclass==2&full_9$deck=="NA"),sampling_ratio[[2]][3]),"deck"]<-rep("F",sampling_ratio[[2]][3])
+
+set.seed(100)
+full_9[sample(which(full_9$pclass==3&full_9$deck=="NA"),sampling_ratio[[3]][1]),"deck"]<-rep("E",sampling_ratio[[3]][1])
+full_9[sample(which(full_9$pclass==3&full_9$deck=="NA"),sampling_ratio[[3]][2]),"deck"]<-rep("F",sampling_ratio[[3]][2])
+full_9[sample(which(full_9$pclass==3&full_9$deck=="NA"),sampling_ratio[[3]][3]),"deck"]<-rep("G",sampling_ratio[[3]][3])
+
+knitr::kable(t(table(full_9$pclass,full_9$deck)), align="l", caption="Number of unique decks imputated")
+```    
+
+We see that the decks has been imputed according to the desired ratio. We now assign the unique tickets with imputed deck back to the full list, and again assign all the tickets with the same number with the same deck using the function we have wrote earlier.       
+
+```{r}
+merge<-function(x,y){
+        dat_2 <- y %>% 
+                dplyr::select(passenger_id, deck)
+        dat<- x %>% left_join(dat_2, by="passenger_id") %>%
+                mutate(deck.x = case_when(!is.na(.$deck.y) ~ .$deck.y,
+                                          TRUE ~ .$deck.x)) %>%
+                dplyr::select(passenger_id:tix_num, deck = deck.x)
+        dat[which(dat$deck == "NA"), "deck"] <- NA
+        return(dat)
+}
+full_10<-merge(full_7,full_9)
+full_11<-same_tix(full_10)
+full_11 %$% knitr::kable(table(deck, pclass),align="l", caption="Total number of decks by pclass")
+```     
+  
+We have now imputed all the data and can move on to regenerating the train/test datasets.       
+  
+## Regenerating the "train" and "test" Dataset
+
+From the full dataset, we split using dplyr::group_split. The train dataset has 891 obs while the test dataset has 418 obs
+```{r}
+full_11<- full_11 %>% dplyr::select(passenger_id,deck)
+to_split<- full_5 %>% dplyr::select(-c(last_name, first_name,ticket, cabin,na,deck)) %>%
+        left_join(full_11,by = "passenger_id") %>%
+        mutate(deck = as.factor(.$deck))
+
+to_split$ageclass = ifelse(to_split$age<=10,1,
+                           ifelse(to_split$age>10 & to_split$age<=20,2,
+                                  ifelse(to_split$age>20 & to_split$age<=35,3,4)))
+to_split$ageclass = as.factor(to_split$ageclass)
+
+
+splitted<- to_split %>% 
+        group_by(type) %>%
+        group_split
+
+train_imp<- train %>% dplyr::select(passenger_id, survived) %>%
+        full_join(splitted[[1]]) 
+
+test_imp<-splitted[[2]]
+
+dim(train_imp)
+dim(test_imp)
+```
+
+We have regenerated our "train" and "test" datasetS. Now we can perform statistical learning.      
+
+# Fitting Models
+
+```{r, echo = TRUE}
+pred<-function(x){
+        data<-predict(x, newdata=test_imp)
+        final<-data.frame(PassengerId = test_imp$passenger_id, Survived = data)
+}
+```  
+
+We generate this "pred" function to generate the prediction dataframe for submission using caret.     
+
+```{r, echo = TRUE}
+compare<-function(x,y){
+        dat<- full_join(x,y, by = "PassengerId") %>%
+                mutate(Survived.x = parse_number(as.character(.$Survived.x))) %>%
+                mutate(Survived.y = parse_number(as.character(.$Survived.y))) %>%
+                mutate(diff = Survived.x - Survived.y) %>%
+                filter(diff != 0) %>%
+                as.data.frame
+        
+        dat_1<- test_imp %>%
+                filter(passenger_id %in% dat$PassengerId) %>%
+                mutate(surv = case_when(dat$diff <0 ~ "model_2", 
+                                        TRUE > 0 ~ "model_1")) %>%
+                as.data.frame
+        list(dat,dat_1)
+}
+```
+
+We generate this function to compare the differences between datasets generated by different methods.
+
+## Logistics Regression
+
+```{r}
+logit_fit_1 <- train(form = survived~pclass+title+sex+family_mem+age+fare+embarked+deck,
+                     data = train_imp,
+                     trControl = trainControl(method = "cv", number = 10),
+                     method = "glm",
+                     family = "binomial"
+)
+logit<-pred(logit_fit_1)
+
+write_csv(logit,"./data/logit.csv")
+logit_fit_1$finalModel
+```    
+
+Using logistic regression, our predictive accuracy is 0.76555.         
+
+## LASSO and Ridge      
+
+```{r, fig.align='center', fig.height= 9, fig.width= 9}
+grid <- 10^seq(10,-2, length=100)
+
+x_mat <-model.matrix(survived~pclass+title+sex+family_mem+age+fare+embarked+deck,
+                     data = train_imp)
+x_mat_test<- model.matrix(~pclass+title+sex+family_mem+age+fare+embarked+deck,
+                          data = test_imp)
+
+y_mat <- parse_number(as.character(train_imp$survived))
+
+ridge_fit = cv.glmnet(x_mat, y_mat, 
+                      family = "binomial", 
+                      alpha = 0,
+                      type.measure = "class")
+
+lasso_fit = cv.glmnet(x_mat, y_mat, 
+                      family = "binomial", 
+                      alpha = 1,
+                      type.measure = "class")
+par(mfrow=c(2,1))
+plot(ridge_fit, main = "Ridge")
+plot(lasso_fit, main = "Lasso")
+
+ridge_pred = predict(ridge_fit, newx=x_mat_test, type="class")
+lasso_pred = predict(lasso_fit, newx=x_mat_test, type="class")
+
+ridge<-data.frame(PassengerId = test_imp$passenger_id, Survived = as.numeric(ridge_pred))
+lasso<-data.frame(PassengerId = test_imp$passenger_id, Survived = as.numeric(lasso_pred))
+
+write_csv(lasso, "./data/ridge.csv")
+write_csv(ridge, "./data/ridge.csv")
+coef(ridge_fit)
+coef(lasso_fit)
+```    
+
+The proportion of correct responses for both ridge and lasso methods are 0.78947.   
+
+## Radial Kernel SVM
+
+```{r}
+set.seed(400)
+svm_fit<- train(survived~pclass+title+sex+family_mem+age+fare+embarked+deck,
+                data = train_imp,
+                trControl = trainControl(method = "cv", number = 10),
+                preProcess = c("center","scale"),
+                method = 'svmRadial')
+
+svm_2<-pred(svm_fit)
+write_csv(svm_2,"./data/svm_2m_2.csv")
+svm_1<-read_csv("./data/svm_1.csv")
+
+svm_fit
+```
+
+The proportion of correct responses for the Radial Kernel SVM method is 0.79904 (Top 12%).
+
+# Conclusion
+
+The different classification methods yields very close results. In order to improve accuracy, we would need a better strategy to impute both the "age" variable and "deck" variable. 
