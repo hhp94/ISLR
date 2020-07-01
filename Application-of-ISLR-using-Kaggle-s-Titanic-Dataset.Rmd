@@ -30,11 +30,12 @@ library("ModelMetrics")
 library("tidyverse")
 library("magrittr")
 library("glmnet")
+library("mice")
 ```
 
 # Acknowledgement
 
-Formatting and data processing ideas are heavily inspired by [Bisaria's post on Kaggle](https://www.kaggle.com/bisaria/titanic-lasso-ridge-implementation/code).    
+Formatting and data processing ideas are inspired by [Bisaria's post on Kaggle](https://www.kaggle.com/bisaria/titanic-lasso-ridge-implementation/code).    
 
 # Skills Involved    
 
@@ -49,6 +50,8 @@ R-base, tidyverse, Statistical Learning, Data Wrangling, String manipulation, fu
 This is an application of some of the statistical learning methods in ISLR. In particular, we are using Logistic Regression, Ridge Regression, Lasso Regression, and Radial SVM to predict the survival status (0 = perished, 1 = survived) of [Kaggle's Titanic Dataset](https://www.kaggle.com/c/titanic/overview). The main challenge of this dataset lies in imputing the variable "age" and "deck." Using `missForest::missForest`, we imputed the age variable. From other clues such as the same ticket numbers would be the same deck, and certain ticket class would correspond to certain decks, we imputed all the decks values.    
 
 Through the process and submission on Kaggle, Radial SVM was the most accurate with the proportion of correct prediction = 0.79904 (Top 12% as of 6/30/2020).    
+
+The code can be found at [Github](https://github.com/hhp94/ISLR/blob/master/Application-of-ISLR-using-Kaggle-s-Titanic-Dataset.Rmd).  
 
 # Load the Data    
 
@@ -517,13 +520,7 @@ From the full dataset, we split using dplyr::group_split. The train dataset has 
 full_11<- full_11 %>% dplyr::select(passenger_id,deck)
 to_split<- full_5 %>% dplyr::select(-c(last_name, first_name,ticket, cabin,na,deck)) %>%
         left_join(full_11,by = "passenger_id") %>%
-        mutate(deck = as.factor(.$deck))
-
-to_split$ageclass = ifelse(to_split$age<=10,1,
-                           ifelse(to_split$age>10 & to_split$age<=20,2,
-                                  ifelse(to_split$age>20 & to_split$age<=35,3,4)))
-to_split$ageclass = as.factor(to_split$ageclass)
-
+        mutate(deck = as.factor(.$deck)) 
 
 splitted<- to_split %>% 
         group_by(type) %>%
@@ -588,7 +585,7 @@ logit_fit_1$finalModel
 
 Using logistic regression, our predictive accuracy is 0.76555.         
 
-## LASSO and Ridge      
+## Lasso and Ridge      
 
 ```{r, fig.align='center', fig.height= 9, fig.width= 9}
 grid <- 10^seq(10,-2, length=100)
@@ -619,11 +616,21 @@ lasso_pred = predict(lasso_fit, newx=x_mat_test, type="class")
 ridge<-data.frame(PassengerId = test_imp$passenger_id, Survived = as.numeric(ridge_pred))
 lasso<-data.frame(PassengerId = test_imp$passenger_id, Survived = as.numeric(lasso_pred))
 
-write_csv(lasso, "./data/ridge.csv")
+write_csv(lasso, "./data/lasso.csv")
 write_csv(ridge, "./data/ridge.csv")
-coef(ridge_fit)
-coef(lasso_fit)
 ```    
+
+Coefficients of Ridge model   
+
+```{r}
+coef(ridge_fit)
+```
+
+Coefficients of Lasso model   
+
+```{r}
+coef(lasso_fit)
+```   
 
 The proportion of correct responses for both ridge and lasso methods are 0.78947.   
 
@@ -637,11 +644,8 @@ svm_fit<- train(survived~pclass+title+sex+family_mem+age+fare+embarked+deck,
                 preProcess = c("center","scale"),
                 method = 'svmRadial')
 
-svm_2<-pred(svm_fit)
-write_csv(svm_2,"./data/svm_2m_2.csv")
-svm_1<-read_csv("./data/svm_1.csv")
-
-svm_fit
+svm<-pred(svm_fit)
+write_csv(svm,"./data/svm.csv")
 ```
 
 The proportion of correct responses for the Radial Kernel SVM method is 0.79904 (Top 12%).
