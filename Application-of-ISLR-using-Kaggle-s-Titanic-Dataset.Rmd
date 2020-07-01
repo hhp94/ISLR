@@ -646,6 +646,7 @@ svm_fit<- train(survived~pclass+title+sex+family_mem+age+fare+embarked+deck,
 
 svm<-pred(svm_fit)
 write_csv(svm,"./data/svm.csv")
+svm_fit
 ```
 
 The proportion of correct responses for the Radial Kernel SVM method is 0.79904 (Top 12%).
